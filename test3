@@ -1,0 +1,318 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+def auto_detect_propeller_and_wing(image_path, show_steps=True):
+    """
+    Automatically detect propeller and wing in MWIR image
+    Wing and propeller appear DARKER (cooler) than clouds/sky
+    
+    Parameters:
+    -----------
+    image_path : str
+        Path to input image
+    show_steps : bool
+        Whether to display detection steps
+    """
+    
+    # Read the image
+    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    
+    # Convert to grayscale if needed
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+    
+    # Normalize to 8-bit for processing
+    if gray.dtype == np.uint16:
+        gray_8bit = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    else:
+        gray_8bit = gray
+    
+    height, width = gray_8bit.shape
+    
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(gray_8bit, (5, 5), 0)
+    
+    # MWIR: Aircraft/propeller appear DARKER (cooler thermal signature)
+    # Invert the logic - look for DARK regions in upper portion
+    # Use MORE AGGRESSIVE threshold to capture entire wing/propeller
+    threshold_value = np.percentile(blurred, 55)  # Bottom 55% (darker pixels)
+    _, binary = cv2.threshold(blurred, threshold_value, 255, cv2.THRESH_BINARY_INV)
+    
+    # Focus on upper portion of image where aircraft is
+    upper_region_mask = np.zeros_like(gray_8bit)
+    upper_region_mask[0:int(height*0.6), :] = 255  # Top 60% of image
+    
+    binary = cv2.bitwise_and(binary, upper_region_mask)
+    
+    # Morphological operations to clean up and EXPAND detection
+    kernel_small = np.ones((3, 3), np.uint8)
+    kernel_medium = np.ones((7, 7), np.uint8)
+    kernel_large = np.ones((11, 11), np.uint8)
+    
+    # Remove small noise
+    binary_cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small)
+    
+    # AGGRESSIVELY close gaps in wing/propeller to connect fragments
+    binary_cleaned = cv2.morphologyEx(binary_cleaned, cv2.MORPH_CLOSE, kernel_large, iterations=3)
+    
+    # Dilate to expand detected regions and capture full structure
+    binary_cleaned = cv2.dilate(binary_cleaned, kernel_medium, iterations=3)
+    
+    # Find connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_cleaned, connectivity=8)
+    
+    # Filter components by size and location - MORE PERMISSIVE
+    wing_mask = np.zeros_like(gray_8bit)
+    propeller_mask = np.zeros_like(gray_8bit)
+    
+    # Collect valid components (be very inclusive)
+    min_area = 50  # Much smaller minimum to catch propeller pieces
+    max_area = height * width * 0.5  # Allow up to 50% of image
+    
+    valid_components = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        
+        # Check if in upper portion and reasonable size - MORE PERMISSIVE
+        if min_area < area < max_area and y < height * 0.7:  # Expanded to top 70%
+            valid_components.append({
+                'label': i,
+                'area': area,
+                'x': x, 'y': y, 'w': w, 'h': h,
+                'aspect_ratio': w / max(h, 1),
+                'centroid': centroids[i]
+            })
+    
+    # Sort by area
+    valid_components.sort(key=lambda x: x['area'], reverse=True)
+    
+    # More aggressive component assignment - include MORE components
+    for comp in valid_components[:5]:  # Take top 5 components instead of filtering strictly
+        if comp['aspect_ratio'] > 1.5 or comp['area'] > 500:
+            # Likely part of wing (horizontal or large)
+            wing_mask[labels == comp['label']] = 255
+        # Also add to propeller mask if vertical or central
+        if comp['aspect_ratio'] < 2.0 or comp['x'] > width * 0.3:
+            propeller_mask[labels == comp['label']] = 255
+    
+    # Additional propeller detection using edge detection - MORE AGGRESSIVE
+    edges = cv2.Canny(blurred, 20, 80)  # Lower thresholds to catch more edges
+    
+    # Apply edge detection only to upper region
+    edges = cv2.bitwise_and(edges, upper_region_mask)
+    
+    # Detect lines (propeller blades are linear) - MORE PERMISSIVE
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20,  # Lower threshold
+                            minLineLength=30, maxLineGap=20)  # Shorter lines, bigger gaps
+    
+    line_mask = np.zeros_like(gray_8bit)
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+            
+            # Accept almost ANY angle for propeller blades (they can be at many angles)
+            if angle > 10:  # Very permissive - almost any non-horizontal line
+                cv2.line(line_mask, (x1, y1), (x2, y2), 255, 18)  # Thicker lines
+    
+    # Combine detected lines with propeller mask
+    propeller_mask = cv2.bitwise_or(propeller_mask, line_mask)
+    
+    # VERY AGGRESSIVE dilation of propeller mask to ensure complete coverage
+    kernel_dilate = np.ones((11, 11), np.uint8)
+    propeller_mask = cv2.dilate(propeller_mask, kernel_dilate, iterations=4)
+    
+    # Make sure propeller mask doesn't overlap too much with wing
+    # Subtract wing from propeller in overlapping areas
+    overlap = cv2.bitwise_and(wing_mask, propeller_mask)
+    propeller_mask = cv2.subtract(propeller_mask, overlap)
+    
+    if show_steps:
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        
+        axes[0, 0].imshow(gray_8bit, cmap='gray')
+        axes[0, 0].set_title('Original Image', fontsize=12)
+        axes[0, 0].axhline(y=height*0.6, color='r', linestyle='--', linewidth=1)
+        axes[0, 0].set_ylabel('Search Region (above red line)', fontsize=10)
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(binary, cmap='gray')
+        axes[0, 1].set_title('Dark Regions (Aircraft)', fontsize=12)
+        axes[0, 1].axis('off')
+        
+        axes[0, 2].imshow(edges, cmap='gray')
+        axes[0, 2].set_title('Edge Detection', fontsize=12)
+        axes[0, 2].axis('off')
+        
+        axes[0, 3].imshow(line_mask, cmap='gray')
+        axes[0, 3].set_title('Detected Lines (Blades)', fontsize=12)
+        axes[0, 3].axis('off')
+        
+        axes[1, 0].imshow(wing_mask, cmap='gray')
+        axes[1, 0].set_title('Wing Mask', fontsize=12)
+        axes[1, 0].axis('off')
+        
+        axes[1, 1].imshow(propeller_mask, cmap='gray')
+        axes[1, 1].set_title('Propeller Mask', fontsize=12)
+        axes[1, 1].axis('off')
+        
+        # Overlay both masks on original
+        overlay = cv2.cvtColor(gray_8bit, cv2.COLOR_GRAY2BGR)
+        overlay[wing_mask > 0] = [0, 255, 0]  # Wing in green
+        overlay[propeller_mask > 0] = [0, 0, 255]  # Propeller in red
+        axes[1, 2].imshow(overlay)
+        axes[1, 2].set_title('Wing (Green) + Propeller (Red)', fontsize=12)
+        axes[1, 2].axis('off')
+        
+        # Combined mask
+        combined_mask = cv2.bitwise_or(wing_mask, propeller_mask)
+        axes[1, 3].imshow(combined_mask, cmap='gray')
+        axes[1, 3].set_title('Combined Aircraft Mask', fontsize=12)
+        axes[1, 3].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig('detection_steps.png', dpi=150, bbox_inches='tight')
+        plt.show()
+    
+    return wing_mask, propeller_mask, gray_8bit
+
+
+def remove_propeller_auto(image_path, output_path='cleaned_auto.png', 
+                          inpaint_method='telea', inpaint_radius=10):
+    """
+    Automatically detect and remove propeller using inpainting
+    
+    Parameters:
+    -----------
+    image_path : str
+        Path to input image
+    output_path : str
+        Path to save cleaned image
+    inpaint_method : str
+        'telea' or 'ns' (Navier-Stokes)
+    inpaint_radius : int
+        Radius of inpainting neighborhood (5-20)
+    """
+    
+    # Detect wing and propeller
+    print("Detecting wing and propeller in upper region...")
+    wing_mask, propeller_mask, gray_8bit = auto_detect_propeller_and_wing(image_path, show_steps=True)
+    
+    print(f"Wing mask pixels: {np.sum(wing_mask > 0)}")
+    print(f"Propeller mask pixels: {np.sum(propeller_mask > 0)}")
+    
+    # Choose inpainting method
+    if inpaint_method.lower() == 'ns':
+        flags = cv2.INPAINT_NS
+    else:
+        flags = cv2.INPAINT_TELEA
+    
+    # Inpaint only the propeller region
+    cleaned = cv2.inpaint(gray_8bit, propeller_mask, inpaintRadius=inpaint_radius, 
+                          flags=flags)
+    
+    # Save result
+    cv2.imwrite(output_path, cleaned)
+    
+    # Create final comparison
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    axes[0].imshow(gray_8bit, cmap='gray')
+    axes[0].set_title('Original Image', fontsize=14, fontweight='bold')
+    axes[0].axis('off')
+    
+    # Show propeller mask on original
+    masked_view = cv2.cvtColor(gray_8bit, cv2.COLOR_GRAY2BGR)
+    masked_view[propeller_mask > 0] = [255, 0, 0]
+    axes[1].imshow(masked_view)
+    axes[1].set_title('Propeller Detected (Red)', fontsize=14, fontweight='bold')
+    axes[1].axis('off')
+    
+    axes[2].imshow(cleaned, cmap='gray')
+    axes[2].set_title('Propeller Removed', fontsize=14, fontweight='bold')
+    axes[2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('final_result.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    print(f"\n✓ Cleaned image saved to: {output_path}")
+    print(f"✓ Detection steps saved to: detection_steps.png")
+    print(f"✓ Final comparison saved to: final_result.png")
+    
+    return cleaned, wing_mask, propeller_mask
+
+
+def manual_mask_creation(image_path):
+    """
+    Create a manual mask by clicking on the image
+    Returns coordinates for adjusting the detection
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+    
+    if gray.dtype == np.uint16:
+        gray_8bit = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    else:
+        gray_8bit = gray
+    
+    print("\nImage statistics:")
+    print(f"Min pixel value: {np.min(gray_8bit)}")
+    print(f"Max pixel value: {np.max(gray_8bit)}")
+    print(f"Mean pixel value: {np.mean(gray_8bit):.1f}")
+    print(f"25th percentile: {np.percentile(gray_8bit, 25):.1f}")
+    print(f"50th percentile: {np.percentile(gray_8bit, 50):.1f}")
+    print(f"75th percentile: {np.percentile(gray_8bit, 75):.1f}")
+    
+    # Show histogram
+    plt.figure(figsize=(10, 4))
+    plt.hist(gray_8bit.ravel(), bins=256, range=(0, 256))
+    plt.title('Image Histogram - Find threshold for aircraft (darker peaks)')
+    plt.xlabel('Pixel Intensity')
+    plt.ylabel('Frequency')
+    plt.savefig('histogram.png', dpi=150)
+    plt.show()
+    
+    return gray_8bit
+
+
+# Example usage:
+if __name__ == "__main__":
+    image_path = "mwir_image.png"  # Replace with your image
+    
+    try:
+        # Step 1: Analyze image to understand intensity distribution
+        print("=" * 60)
+        print("Step 1: Analyzing image...")
+        print("=" * 60)
+        manual_mask_creation(image_path)
+        
+        # Step 2: Automatic detection and removal
+        print("\n" + "=" * 60)
+        print("Step 2: Detecting and removing propeller...")
+        print("=" * 60)
+        cleaned, wing, prop = remove_propeller_auto(image_path, 
+                                                     'cleaned_auto.png',
+                                                     inpaint_method='telea',
+                                                     inpaint_radius=10)
+        
+        print("\nIf detection is not accurate, adjust these parameters:")
+        print("- Change threshold percentile (currently 40) in line 33")
+        print("- Adjust min_area (currently 200) for smaller/larger features")
+        print("- Modify upper_region_mask (currently top 60%) in line 37")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
